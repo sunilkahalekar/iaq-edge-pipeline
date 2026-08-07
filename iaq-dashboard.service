@@ -1,0 +1,30 @@
+[Unit]
+Description=IAQ Dashboard (reads SQLite, serves web UI)
+After=network-online.target iaq-pipeline.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi4
+WorkingDirectory=/home/pi4/iaq_pipeline
+ExecStart=/home/pi4/iaq_pipeline/venv/bin/python /home/pi4/iaq_pipeline/dashboard.py --db /home/pi4/iaq_data/iaq.db --port 8001
+Restart=on-failure
+RestartSec=5
+# PI4: dashboard is read-only and not time-critical -- give the inference
+# pipeline scheduling priority over this process (see iaq-pipeline.service).
+Nice=5
+StandardOutput=append:/home/pi4/iaq_data/dashboard.log
+StandardError=append:/home/pi4/iaq_data/dashboard.log
+
+[Install]
+WantedBy=multi-user.target
+
+# Install with:
+#   sudo cp iaq-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iaq-dashboard.service
+#
+# Check status / logs with:
+#   sudo systemctl status iaq-dashboard.service
+#   journalctl -u iaq-dashboard.service -f
+#   tail -f /home/pi4/iaq_data/dashboard.log

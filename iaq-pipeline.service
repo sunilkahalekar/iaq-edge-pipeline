@@ -1,0 +1,30 @@
+[Unit]
+Description=IAQ YOLO Pipeline (door/person tracking -> SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi4
+WorkingDirectory=/home/pi4/iaq_pipeline
+ExecStart=/home/pi4/iaq_pipeline/venv/bin/python /home/pi4/iaq_pipeline/iaq_pipeline_pi.py
+Restart=on-failure
+RestartSec=5
+# PI4: inference is the time-critical workload -- give it normal/default
+# priority (0) so the scheduler favors it over the dashboard below.
+Nice=0
+StandardOutput=append:/home/pi4/iaq_data/pipeline.log
+StandardError=append:/home/pi4/iaq_data/pipeline.log
+
+[Install]
+WantedBy=multi-user.target
+
+# Install with:
+#   sudo cp iaq-pipeline.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iaq-pipeline.service
+#
+# Check status / logs with:
+#   sudo systemctl status iaq-pipeline.service
+#   journalctl -u iaq-pipeline.service -f
+#   tail -f /home/pi/iaq_data/pipeline.log

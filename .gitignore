@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# Runtime data - never commit captured footage, database, or logs
+*.db
+*.db-wal
+*.db-shm
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.log
+camera_test*.jpg
+
+# Model weights and exports - large binary files, distribute separately
+*.pt
+*.onnx
+best_ncnn_model/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+*.swp

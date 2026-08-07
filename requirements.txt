@@ -1,0 +1,18 @@
+# Raspberry Pi 4 (64-bit Raspberry Pi OS / Bookworm recommended)
+# Install inside a virtualenv:
+#   python3 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+
+ultralytics>=8.2.0
+opencv-python-headless>=4.9.0
+supervision>=0.21.0
+numpy>=1.24
+flask>=3.0.0
+
+# NCNN backend used by ultralytics export/inference on ARM.
+# If pip install fails for your Pi's Python/OS combo, ultralytics will
+# still fall back to onnxruntime for `format=onnx` exports instead.
+ncnn>=1.0.20240410
+
+# Uncomment if you switch db_writer.py to a central PostgreSQL backend
+# psycopg2-binary>=2.9
