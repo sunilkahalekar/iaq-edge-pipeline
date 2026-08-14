@@ -1,6 +1,10 @@
 # IAQ Door & Occupancy Monitor — Raspberry Pi 4
 
-A self-contained system that watches a camera feed with a YOLO segmentation model, tracks door open/closed state per machine and live person count, logs everything to a local SQLite database once per second, and serves a live web dashboard — all running on a single Raspberry Pi 4, no cloud dependency required.
+A self-contained system that watches a camera feed with a YOLO segmentation model, tracks door open/closed state per machine and live person count, logs everything to a local SQLite database once per second, and serves a live web dashboard — all running on a single Raspberry Pi 4, no cloud dependency required. Optionally also ingests four pollutant sensors and runs a live 10-minute-ahead air-quality forecast, via two companion repos — see [step 13](#13-pollutant-sensor-ingestion) and [step 14](#14-bilstm-forecast-sidecar).
+
+> Modifying this codebase? See [CLAUDE.md](CLAUDE.md) for the internals
+> reference — the three-process architecture, timestamp-handling gotchas,
+> and why some things are deliberately duplicated across repos.
 
 | | |
 |---|---|
@@ -32,6 +36,8 @@ A self-contained system that watches a camera feed with a YOLO segmentation mode
   - [10. Run the pipeline (foreground test)](#10-run-the-pipeline-foreground-test)
   - [11. Run the dashboard](#11-run-the-dashboard)
   - [12. Install as background services](#12-install-as-background-services)
+  - [13. Pollutant sensor ingestion](#13-pollutant-sensor-ingestion)
+  - [14. BiLSTM forecast sidecar](#14-bilstm-forecast-sidecar)
 - [Configuration Reference](#configuration-reference)
 - [Verifying a Healthy Deployment](#verifying-a-healthy-deployment)
 - [Troubleshooting](#troubleshooting)
@@ -44,30 +50,51 @@ A self-contained system that watches a camera feed with a YOLO segmentation mode
 
 ## Architecture
 
-One camera, one model instance, one writer process — everything else reads from the database.
+Three independent processes, each owning exactly one thing, all meeting
+only at the SQLite file. Nothing here shares a connection or a thread
+across process boundaries.
 
 ```mermaid
 flowchart LR
     CAM["Camera<br/>(USB / CSI)"] --> PIPE
+    SENS["PMS5003 / MH-Z19B /<br/>SGP40 / DHT22"] --> SVC
 
-    subgraph PIPE["iaq_pipeline_pi.py — single process"]
+    subgraph PIPE["iaq_pipeline_pi.py<br/>(1 Hz, Nice=0)"]
         direction TB
-        CAP["1 Hz capture tick"] --> INF["YOLO inference<br/>(NCNN, segmentation)"]
-        INF --> DET["Detections:<br/>persons + door states"]
-        DET --> DB_W["AsyncDBWriter<br/>(single writer thread)"]
-        DET --> STREAM["MJPEG stream<br/>:8000/video"]
+        CAP["capture tick"] --> INF["YOLO inference<br/>(NCNN, segmentation)"]
+        INF --> DET["persons + door states"]
     end
 
-    DB_W --> DB[("SQLite<br/>WAL mode<br/>iaq.db")]
+    subgraph SVC["iaq_sensors.py<br/>(~1/min, Nice=5)"]
+        direction TB
+        POLL["per-sensor poller threads"] --> AGG["60s aggregator"]
+    end
+
+    subgraph FC["iaq_forecast.py *<br/>(1/min, Nice=10)"]
+        direction TB
+        Q["query ct_vectors +<br/>sensor_readings"] --> FE["feature engineering<br/>+ ONNX inference"]
+    end
+
+    DET -->|own AsyncDBWriter| DB[("SQLite WAL<br/>iaq.db")]
+    AGG -->|own AsyncDBWriter| DB
+    DB -->|read-only| FC
+    FC -->|own AsyncDBWriter| DB
+
     DB -->|read-only| DASH["dashboard.py<br/>:8001"]
-    STREAM -->|embedded &lt;img&gt;| DASH
+    PIPE -->|MJPEG :8000| DASH
     DASH --> BROWSER["Any browser<br/>on the LAN"]
 ```
+<sub>* `iaq_forecast.py` lives in the companion repo
+<a href="https://github.com/sunilkahalekar/context-aware-bilstm-edge">context-aware-bilstm-edge</a>,
+deployed by copying it into this repo's directory on the Pi — see
+<a href="#13-pollutant-sensor-ingestion">step 13</a> and
+<a href="#14-bilstm-forecast-sidecar">step 14</a>.</sub>
 
 **Why this shape, specifically:**
 - **One process owns the camera.** Running a separate video-preview process and the DB-writing pipeline at the same time causes camera contention — most drivers only allow one exclusive reader. Streaming is built into the pipeline itself instead.
-- **One writer, one SQLite connection.** SQLite's WAL mode allows only one writer to hold the file lock at a time; giving every table its own connection caused intermittent `database is locked` errors under load. A single `AsyncDBWriter` thread serializes all writes across all four tables.
-- **The dashboard never writes.** It opens the database in read-only mode, so it can never contend with or corrupt what the pipeline is doing, and can be restarted independently at any time.
+- **Three processes, three independent `AsyncDBWriter`s, one SQLite file.** SQLite's WAL mode allows only one writer to hold the file lock at a time; giving every *table* its own connection *within one process* caused intermittent `database is locked` errors under load (the original bug this architecture already fixed once). Three separate processes, each with exactly one connection and short, deadline-driven commits, is a different and safe pattern — occasional brief lock contention is covered by each connection's busy timeout, and write volume from the sensor/forecast processes is low (about once a minute each). Full reasoning in [CLAUDE.md](CLAUDE.md).
+- **The dashboard never writes.** It opens the database in read-only mode, so it can never contend with or corrupt what any writer is doing, and can be restarted independently at any time.
+- **Camera > sensors > forecast, in scheduling priority** (`Nice=0/5/10`). A missed camera frame is gone forever; a late sensor sample or forecast is a minor, recoverable gap.
 
 ---
 
@@ -317,6 +344,142 @@ journalctl -u iaq-pipeline -f
 journalctl -u iaq-dashboard -f
 ```
 
+The camera pipeline and dashboard are now fully running. The next two
+steps are optional and independent of each other and of steps 1–12 above
+— skip either or both if you only need door/occupancy monitoring.
+
+### 13. Pollutant sensor ingestion
+
+A separate process (`iaq_sensors.py`, own systemd unit) polls four
+pollutant/environmental sensors and writes one aggregated row to a
+`sensor_readings` table every 60 seconds, aligned to the wall-clock
+minute boundary using the same naive-local-time convention
+`ct_vectors.window_start` uses (see [CLAUDE.md](CLAUDE.md) for why that
+consistency matters and `ct_vectors` itself is NOT minute-aligned).
+
+**Wiring:**
+
+| Sensor | Measures | Interface | Notes |
+|---|---|---|---|
+| PMS5003 | PM1/PM2.5/PM10 | UART, 9600 baud | ~30s fan warm-up before readings are trustworthy |
+| MH-Z19B | CO2 | UART, 9600 baud, command/response | 3-minute preheat; needs its OWN serial port, separate from PMS5003 |
+| SGP40 | VOC index | I2C, address `0x59` | Needs temp/humidity compensation, supplied from DHT22 each cycle |
+| DHT22/AM2302 | Temp/humidity | Single GPIO pin (default BCM4) | Checksum failures some % of the time are normal, not a bug |
+
+The Pi 4's one hardware UART (GPIO14/15) is shared with Bluetooth by
+default — free it for one sensor with `dtoverlay=disable-bt` in
+`/boot/firmware/config.txt`, and put the other sensor on a cheap
+USB-to-TTL adapter. You cannot put both UART sensors on the same port.
+
+```bash
+sudo apt install libgpiod2
+pip install -r requirements.txt   # already includes pyserial, smbus2,
+                                   # sensirion-gas-index-algorithm,
+                                   # adafruit-circuitpython-dht, Adafruit-Blinka
+
+# Enable I2C for SGP40:
+sudo raspi-config   # Interface Options -> I2C -> Enable
+
+# Confirm actual serial device paths after wiring -- USB enumeration
+# order isn't guaranteed stable across reboots if other USB-serial
+# devices are plugged in; use /dev/serial/by-id/... for a stable path.
+ls /dev/ttyUSB* /dev/ttyAMA*
+```
+✅ Both expected serial devices appear.
+
+Edit `PMS5003_PORT` / `MHZ19B_PORT` / `I2C_BUS` / `DHT22_GPIO_PIN` at the
+top of `iaq_sensors.py` to match your wiring, then test in the foreground
+before installing as a service:
+```bash
+python3 iaq_sensors.py
+```
+✅ Prints one line per minute like
+`[2026-08-14 09:15:00] predicted for...` — wait, that's the forecast
+sidecar's log format; `iaq_sensors.py` instead prints a warning line
+listing any columns missing for the window (or nothing, if all four
+sensors reported successfully), once per minute. Let it run 3-4 minutes,
+`Ctrl+C`, then confirm data landed:
+```bash
+sqlite3 /home/pi4/iaq_data/iaq.db "SELECT * FROM sensor_readings ORDER BY id DESC LIMIT 5;"
+```
+✅ Real, recent, increasing `window_start` values with mostly non-NULL
+readings (some NULLs are expected and fine — see caveats below).
+
+Install as a service:
+```bash
+sudo cp iaq-sensors.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now iaq-sensors.service
+sudo systemctl status iaq-sensors.service
+```
+✅ `active (running)`.
+
+**Known caveats, not implementation bugs** (full detail in
+`sensors/*.py` docstrings and [CLAUDE.md](CLAUDE.md)):
+- DHT22 checksum failures happen normally; a window with no successful
+  read reports `temp`/`hum` as `NULL`, not a fabricated value.
+- MH-Z19B's auto-baseline-calibration assumes fresh ~400ppm air at least
+  once every 24h — a continuously-occupied room can drift the baseline;
+  disable ABC and calibrate manually if that's your deployment.
+- SGP40's VOC Index needs continuous ~1Hz sampling internally to
+  converge — already handled by the aggregator, not something to tune.
+- Zero built-in redundancy: if a serial port or I2C bus becomes
+  unavailable mid-run, that sensor's columns go permanently `NULL` until
+  the service restarts.
+- **Not yet run against real hardware as of this writing** — the
+  protocol/checksum math was verified against known-good datasheet/
+  Sensirion test vectors in isolation, and the DB/aggregation logic was
+  integration-tested against a realistic synthetic database, but
+  end-to-end behavior on an actual wired Pi is unconfirmed. Run steps
+  above carefully and don't skip the verification checks.
+
+### 14. BiLSTM forecast sidecar
+
+A third process, `iaq_forecast.py`, lives in the companion repo
+[context-aware-bilstm-edge](https://github.com/sunilkahalekar/context-aware-bilstm-edge)
+— it reads live from `ct_vectors` + `sensor_readings` (no CSV anywhere in
+this path) and writes 10-minutes-ahead pollutant predictions to a
+`forecasts` table. Requires step 13 above (it needs `sensor_readings` to
+have real data) and a trained, exported model (see that repo's own
+README for the train → export workflow, which runs on a dev machine, not
+the Pi).
+
+```bash
+# On the dev machine that trained the model (see context-aware-bilstm-edge/README.md):
+#   python train_bilstm.py --csv ... --outdir runs/v1
+#   python export_onnx.py --checkpoint runs/v1/BiLSTM_edge_ck.pt \
+#       --bundle runs/v1/preprocessing_bundle --outdir runs/v1/onnx_export
+
+# Copy the model bridge into THIS repo's directory on the Pi, alongside db_writer.py:
+scp -r runs/v1/onnx_export iaq_forecast.py iaq-forecast.service \
+    feature_engineering.py models.py pi4@<PI_IP_ADDRESS>:/home/pi4/iaq_pipeline/
+```
+
+On the Pi:
+```bash
+pip install onnxruntime   # NOT torch -- see context-aware-bilstm-edge's
+                           # requirements.txt for why the Pi-side runtime
+                           # deliberately excludes it
+sudo cp iaq-forecast.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now iaq-forecast.service
+journalctl -u iaq-forecast.service -f
+```
+✅ Logs show `[<timestamp>] predicted for <timestamp+10min>: pm2.5=...
+co2=... voc=...` once a minute.
+```bash
+sqlite3 /home/pi4/iaq_data/iaq.db "SELECT * FROM forecasts ORDER BY id DESC LIMIT 5;"
+```
+✅ Real, recent, increasing `predicted_at` values.
+
+**Full detail, including what's verified vs. not**:
+[context-aware-bilstm-edge/README.md](https://github.com/sunilkahalekar/context-aware-bilstm-edge)'s
+Status section — at minimum, know that the actual model training and
+ONNX export have not been run in the environment this was built in (no
+PyTorch/onnxruntime available there), so confirm the model's printed
+test-set R²/RMSE/MAE on your own training run before trusting its
+predictions.
+
 ---
 
 ## Configuration Reference
@@ -350,13 +513,14 @@ journalctl -u iaq-dashboard -f
 
 ## Verifying a Healthy Deployment
 
-A quick checklist to run after any change or restart:
+A quick checklist to run after any change or restart. Steps 1-4 apply
+always; 5-6 only if you installed the optional sensor/forecast services.
 
 ```bash
-# 1. Both services running
-sudo systemctl is-active iaq-pipeline iaq-dashboard
+# 1. Services running (drop iaq-sensors/iaq-forecast if not installed)
+sudo systemctl is-active iaq-pipeline iaq-dashboard iaq-sensors iaq-forecast
 
-# 2. Data actively growing
+# 2. Camera data actively growing
 sqlite3 /home/pi4/iaq_data/iaq.db "SELECT COUNT(*) FROM tracking_telemetry;"
 # wait 30s, run again — count should have increased
 
@@ -366,6 +530,13 @@ sqlite3 /home/pi4/iaq_data/iaq.db "PRAGMA integrity_check;"
 
 # 4. Dashboard reachable and showing a green pipeline badge
 curl -s http://localhost:8001/api/status | python3 -m json.tool
+
+# 5. Sensor data actively growing (if installed)
+sqlite3 /home/pi4/iaq_data/iaq.db "SELECT COUNT(*) FROM sensor_readings;"
+# wait 90s, run again — count should have increased by ~1
+
+# 6. Forecasts actively growing (if installed)
+sqlite3 /home/pi4/iaq_data/iaq.db "SELECT predicted_at, predicted_for, pm2_5, co2 FROM forecasts ORDER BY id DESC LIMIT 3;"
 ```
 
 ---
@@ -411,76 +582,6 @@ Backups, safe to run while the pipeline is writing:
 ```bash
 sqlite3 /home/pi4/iaq_data/iaq.db ".backup /home/pi4/iaq_data/backups/iaq_$(date +%Y%m%d_%H%M%S).db"
 ```
-
----
-
-## Sensor Ingestion (PMS5003 / MH-Z19B / SGP40 / DHT22)
-
-A second, independent process (`iaq_sensors.py`, own systemd unit) polls four
-pollutant/environmental sensors and writes one aggregated row to the new
-`sensor_readings` table every 60 seconds, aligned to the same wall-clock
-minute boundary, using the same naive-local-time convention
-`ct_vectors.window_start` uses. The two tables do NOT exact-match on
-`window_start` — `ct_vectors`' windows aren't minute-aligned (they drift
-from Pi boot time; see `sensors/aggregator.py`'s docstring) — so
-`iaq_forecast.py` joins them by flooring both to the minute at query time,
-the same "floor_to_minute" approach the offline
-`merge_vision_and_sensor_data.py` already uses.
-
-**Wiring:**
-- **PMS5003** (PM1/PM2.5/PM10) — UART, 9600 baud. The Pi 4's one hardware
-  UART (GPIO14/15) is routed to Bluetooth by default; either disable
-  Bluetooth (`dtoverlay=disable-bt` in `/boot/firmware/config.txt`) to free
-  it, or use a USB-to-TTL adapter.
-- **MH-Z19B** (CO2) — UART, 9600 baud, command/response protocol. Needs its
-  own serial port, separate from PMS5003 — typically a second USB-to-TTL
-  adapter.
-- **SGP40** (VOC index) — I2C, address 0x59. Enable I2C via `raspi-config`
-  first. Needs temperature/humidity compensation, supplied from the DHT22
-  reading each cycle.
-- **DHT22/AM2302** (temp/humidity) — single GPIO data pin (default BCM4).
-
-**Install:**
-```bash
-# requirements.txt already includes pyserial, smbus2,
-# sensirion-gas-index-algorithm, adafruit-circuitpython-dht, Adafruit-Blinka
-sudo apt install libgpiod2
-pip install -r requirements.txt
-
-# Confirm actual serial device paths after wiring — USB enumeration order
-# isn't guaranteed stable across reboots if other USB-serial devices are
-# plugged in; use /dev/serial/by-id/... for a stable path if that matters.
-ls /dev/ttyUSB* /dev/ttyAMA*
-
-# Edit PMS5003_PORT / MHZ19B_PORT / I2C_BUS / DHT22_GPIO_PIN at the top of
-# iaq_sensors.py to match your actual wiring, then:
-sudo cp iaq-sensors.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now iaq-sensors.service
-journalctl -u iaq-sensors.service -f
-```
-
-**Known caveats, not implementation bugs:**
-- DHT22 reads fail checksum some fraction of the time even with the
-  C-backed timing library — normal for this sensor/protocol. A window with
-  no successful DHT22 read reports `temp`/`hum` as `NULL` rather than a
-  stale or fabricated value; the training pipeline's own
-  `feature_engineering.py` already forward/back-fills missing values, so
-  this degrades gracefully downstream.
-- MH-Z19B's factory auto-baseline-calibration assumes the sensor sees
-  fresh ~400ppm air at least once every 24h. If this room is continuously
-  occupied, ABC can drift the CO2 baseline over time — consider disabling
-  ABC and calibrating manually if that's the case for your deployment.
-- SGP40's VOC Index needs a continuous ~1Hz sampling stream to converge
-  (Sensirion's gas-index algorithm maintains a running baseline) — the
-  aggregator samples it every ~1s internally regardless of the 60s output
-  cadence for exactly this reason; don't reduce that internal rate.
-- This ingestion path is new and has not been run against real hardware
-  as part of this change — the protocol/checksum logic for all three
-  custom drivers (PMS5003, MH-Z19B, SGP40's CRC-8) was verified against
-  known-good test vectors and datasheet values in isolation, and the
-  aggregation + dual-writer-process DB logic was integration-tested, but
-  end-to-end behavior on an actual wired Pi still needs to be confirmed.
 
 ---
 
