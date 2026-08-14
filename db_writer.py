@@ -66,6 +66,32 @@ RAW_DET_COLUMNS = [
     "Class_Name", "Confidence", "X1", "Y1", "X2", "Y2",
 ]
 
+# ── Table 5: 60-second pollutant sensor windows ─────────────────────────────
+# Column names deliberately match what
+# context-aware-bilstm/src/modeling/feature_engineering.py's
+# build_base_columns() expects verbatim (temp, hum, pm1, pm2_5, pm10, co2,
+# voc) -- see sensors/aggregator.py's docstring. window_start is aligned
+# to wall-clock minute boundaries (naive local time, matching
+# iaq_pipeline_pi.py's own clock convention) -- but ct_vectors.window_start
+# is NOT minute-aligned, so joining these two tables requires flooring
+# both to the minute at query time (iaq_forecast.py does this), not an
+# exact window_start match.
+SENSOR_COLUMNS = [
+    "window_start", "pm1", "pm2_5", "pm10", "co2", "voc", "temp", "hum",
+]
+
+# ── Table 6: BiLSTM forecasts, written by iaq_forecast.py (own process) ────
+# predicted_at: when this prediction was made (naive local time, matching
+# every other timestamp column in this DB). predicted_for: predicted_at +
+# lead_minutes -- the time this row's pm1/pm2_5/pm10/co2/voc values are a
+# forecast FOR, not a reading of. Kept as separate columns (not just
+# predicted_at + a fixed lead assumed elsewhere) so lead_minutes can change
+# between model versions without breaking historical rows' meaning.
+FORECAST_COLUMNS = [
+    "predicted_at", "predicted_for", "lead_minutes",
+    "pm1", "pm2_5", "pm10", "co2", "voc",
+]
+
 # Column -> SQLite type affinity. Anything not listed here defaults to TEXT.
 _NUMERIC_INT = {
     "M1_tau_open", "M2_tau_open", "M3_tau_open",
@@ -74,7 +100,7 @@ _NUMERIC_INT = {
     "n_person", "Unix_ms", "Zone_Count",
     "M1_Toggles", "M2_Toggles", "M3_Toggles",
     "Person_Count_Max", "Unique_Total_Persons",
-    "Frame_Number",
+    "Frame_Number", "lead_minutes",
 }
 _NUMERIC_REAL = {
     "M1_rho_open", "M2_rho_open", "M3_rho_open",
@@ -84,6 +110,7 @@ _NUMERIC_REAL = {
     "M1_Swap_Sec", "M2_Swap_Sec", "M3_Swap_Sec",
     "Motion_Score_This_Second",
     "Confidence", "X1", "Y1", "X2", "Y2",
+    "pm1", "pm2_5", "pm10", "co2", "voc", "temp", "hum",
 }
 
 
@@ -109,10 +136,15 @@ CT_TABLE = "ct_vectors"
 SEC_TABLE = "per_second_analytics"
 TELEM_TABLE = "tracking_telemetry"
 RAW_DET_TABLE = "raw_detections"
+SENSOR_TABLE = "sensor_readings"
+FORECAST_TABLE = "forecasts"
 
 
 def init_db(db_path: str):
-    """Create the DB file (if needed) and all four tables. Call once at startup."""
+    """Create the DB file (if needed) and all six tables. Call once at
+    startup -- safe to call from iaq_pipeline_pi.py, iaq_sensors.py, AND
+    iaq_forecast.py (IF NOT EXISTS), since any of the three might start
+    first."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -124,12 +156,16 @@ def init_db(db_path: str):
     conn.execute(_create_table_sql(SEC_TABLE, SEC_COLUMNS))
     conn.execute(_create_table_sql(TELEM_TABLE, TELEM_COLUMNS))
     conn.execute(_create_table_sql(RAW_DET_TABLE, RAW_DET_COLUMNS))
+    conn.execute(_create_table_sql(SENSOR_TABLE, SENSOR_COLUMNS))
+    conn.execute(_create_table_sql(FORECAST_TABLE, FORECAST_COLUMNS))
     # Helpful indexes for common queries (latest-first, per-window lookups)
     conn.execute(f'CREATE INDEX IF NOT EXISTS idx_ct_ws ON {CT_TABLE}(window_start);')
     conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sec_ts ON {SEC_TABLE}(Timestamp);')
     conn.execute(f'CREATE INDEX IF NOT EXISTS idx_tel_ts ON {TELEM_TABLE}(Timestamp_ISO8601);')
     conn.execute(f'CREATE INDEX IF NOT EXISTS idx_raw_ts ON {RAW_DET_TABLE}(Timestamp_ISO8601);')
     conn.execute(f'CREATE INDEX IF NOT EXISTS idx_raw_class ON {RAW_DET_TABLE}(Class_Name);')
+    conn.execute(f'CREATE INDEX IF NOT EXISTS idx_sensor_ws ON {SENSOR_TABLE}(window_start);')
+    conn.execute(f'CREATE INDEX IF NOT EXISTS idx_forecast_pf ON {FORECAST_TABLE}(predicted_for);')
     conn.commit()
     conn.close()
 
@@ -270,3 +306,46 @@ def make_writers(db_path: str, commit_every_sec: float = 10.0):
     tel_writer = TableWriterHandle(shared, TELEM_TABLE, TELEM_COLUMNS)
     det_writer = TableWriterHandle(shared, RAW_DET_TABLE, RAW_DET_COLUMNS)
     return ct_writer, sec_writer, tel_writer, det_writer, shared
+
+
+def make_sensor_writer(db_path: str, commit_every_sec: float = 10.0):
+    """
+    Separate from make_writers() on purpose: iaq_sensors.py runs as its own
+    process (own systemd unit), not a thread inside iaq_pipeline_pi.py, so
+    it needs its own AsyncDBWriter instance -- extending make_writers()'s
+    return tuple would have broken iaq_pipeline_pi.py's existing unpacking
+    call. Two independent single-writer-thread processes sharing one
+    SQLite file (both WAL mode, both with 30s busy timeout, both batching
+    commits) is safe -- this is NOT the "one connection per table within
+    one process" pattern that caused the original "database is locked"
+    bug (see AsyncDBWriter's docstring); it's two well-behaved writers
+    that will occasionally, briefly serialize on the file lock, which the
+    busy timeout already covers. Sensor writes happen once per 60s, so
+    that contention window is rare and short.
+
+    Returns (sensor_writer, shared_writer). Call shared_writer.close()
+    once at shutdown.
+    """
+    init_db(db_path)
+    shared = AsyncDBWriter(db_path, commit_every_sec=commit_every_sec)
+    sensor_writer = TableWriterHandle(shared, SENSOR_TABLE, SENSOR_COLUMNS)
+    return sensor_writer, shared
+
+
+def make_forecast_writer(db_path: str, commit_every_sec: float = 5.0):
+    """
+    Third independent process/writer, same reasoning as
+    make_sensor_writer() above. Forecasts happen once per minute (lower
+    volume than either camera or sensor writes), so contention risk is
+    even smaller than the sensor writer's already-small one. Shorter
+    default commit interval than make_sensor_writer's (5s vs 10s) since a
+    forecast is only useful if it shows up promptly -- there's no SD-card-
+    wear argument for batching harder here, write volume is tiny.
+
+    Returns (forecast_writer, shared_writer). Call shared_writer.close()
+    once at shutdown.
+    """
+    init_db(db_path)
+    shared = AsyncDBWriter(db_path, commit_every_sec=commit_every_sec)
+    forecast_writer = TableWriterHandle(shared, FORECAST_TABLE, FORECAST_COLUMNS)
+    return forecast_writer, shared

@@ -1,0 +1,35 @@
+[Unit]
+Description=IAQ Pollutant Sensor Ingestion (PMS5003/MH-Z19B/SGP40/DHT22 -> SQLite)
+After=network-online.target iaq-pipeline.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi4
+WorkingDirectory=/home/pi4/iaq_pipeline
+ExecStart=/home/pi4/iaq_pipeline/venv/bin/python /home/pi4/iaq_pipeline/iaq_sensors.py
+Restart=on-failure
+RestartSec=5
+# PI4: sensor polling is not time-critical the way camera inference is --
+# lower priority than iaq-pipeline.service so a brief scheduling delay
+# here never steals a frame deadline from the vision pipeline.
+Nice=5
+StandardOutput=append:/home/pi4/iaq_data/sensors.log
+StandardError=append:/home/pi4/iaq_data/sensors.log
+
+[Install]
+WantedBy=multi-user.target
+
+# Install with:
+#   sudo cp iaq-sensors.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iaq-sensors.service
+#
+# Check status / logs with:
+#   sudo systemctl status iaq-sensors.service
+#   journalctl -u iaq-sensors.service -f
+#   tail -f /home/pi4/iaq_data/sensors.log
+#
+# NOTE: does not require iaq-pipeline.service to be running -- listed in
+# After= only so boot ordering is predictable, not because of a runtime
+# dependency. If the camera pipeline crashes, sensor ingestion keeps going.

@@ -16,3 +16,16 @@ ncnn>=1.0.20240410
 
 # Uncomment if you switch db_writer.py to a central PostgreSQL backend
 # psycopg2-binary>=2.9
+
+# ── Pollutant sensor ingestion (iaq_sensors.py, sensors/) ──────────────────
+# PMS5003 (PM) and MH-Z19B (CO2) are plain UART protocols -- pyserial only.
+pyserial>=3.5
+# SGP40 (VOC) over I2C.
+smbus2>=0.4.3
+# Official Sensirion VOC-index conversion for SGP40's raw ticks -- do not
+# hand-roll this, see sensors/sgp40.py's docstring for why.
+sensirion-gas-index-algorithm>=3.2.1
+# DHT22/AM2302 over GPIO -- needs the C-backed timing library, not a pure
+# pip install; also run: sudo apt install libgpiod2  (Bookworm)
+adafruit-circuitpython-dht>=3.7.9
+Adafruit-Blinka>=8.0.0

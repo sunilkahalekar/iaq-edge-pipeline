@@ -91,9 +91,47 @@ CREATE TABLE IF NOT EXISTS raw_detections (
     Y2                 REAL
 );
 
+-- ── Table 5: 60-second pollutant sensor windows (written by iaq_sensors.py,
+--    a separate process/service from the one that writes tables 1-4) ──
+-- Column names match feature_engineering.py's build_base_columns() verbatim
+-- (temp, hum, pm1, pm2_5, pm10, co2, voc). window_start here IS aligned to
+-- wall-clock minute boundaries, but ct_vectors.window_start is NOT (it
+-- drifts from Pi boot time) -- joining the two requires flooring both to
+-- the minute at query time (see iaq_forecast.py), not an exact match.
+CREATE TABLE IF NOT EXISTS sensor_readings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_start   TEXT,
+    pm1            REAL,
+    pm2_5          REAL,
+    pm10           REAL,
+    co2            REAL,
+    voc            REAL,
+    temp           REAL,
+    hum            REAL
+);
+
+-- ── Table 6: BiLSTM forecasts (written by iaq_forecast.py, a third
+--    separate process/service) ──
+-- predicted_for = predicted_at + lead_minutes. lead_minutes stored per row
+-- (not assumed fixed) so it can change between model versions without
+-- breaking historical rows' meaning.
+CREATE TABLE IF NOT EXISTS forecasts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    predicted_at   TEXT,
+    predicted_for  TEXT,
+    lead_minutes   INTEGER,
+    pm1            REAL,
+    pm2_5          REAL,
+    pm10           REAL,
+    co2            REAL,
+    voc            REAL
+);
+
 -- ── Indexes for the queries you'll actually run (latest-first, date range) ──
 CREATE INDEX IF NOT EXISTS idx_ct_ws  ON ct_vectors(window_start);
 CREATE INDEX IF NOT EXISTS idx_sec_ts ON per_second_analytics(Timestamp);
 CREATE INDEX IF NOT EXISTS idx_tel_ts ON tracking_telemetry(Timestamp_ISO8601);
 CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_detections(Timestamp_ISO8601);
 CREATE INDEX IF NOT EXISTS idx_raw_class ON raw_detections(Class_Name);
+CREATE INDEX IF NOT EXISTS idx_sensor_ws ON sensor_readings(window_start);
+CREATE INDEX IF NOT EXISTS idx_forecast_pf ON forecasts(predicted_for);

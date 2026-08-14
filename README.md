@@ -89,7 +89,15 @@ iaq_pipeline/
 ├── static/
 │   └── chart.umd.js          # Self-hosted Chart.js (no CDN/internet dependency)
 ├── iaq-pipeline.service      # systemd unit — main pipeline
-└── iaq-dashboard.service     # systemd unit — dashboard
+├── iaq-dashboard.service     # systemd unit — dashboard
+├── iaq_sensors.py             # Separate process: pollutant sensors + DB writer
+├── iaq-sensors.service       # systemd unit — sensor ingestion
+└── sensors/
+    ├── pms5003.py             # PM1/PM2.5/PM10 over UART
+    ├── mhz19b.py               # CO2 over UART
+    ├── sgp40.py                 # VOC index over I2C
+    ├── dht22.py                  # Temp/humidity over 1-wire GPIO
+    └── aggregator.py            # Polls all four, emits one 60s row
 ```
 
 `live_stream.py`, if present from earlier development, is now superseded by the streaming built into `iaq_pipeline_pi.py` — keep it only as a standalone diagnostic tool when the main pipeline isn't running, never alongside it (camera contention).
@@ -406,11 +414,85 @@ sqlite3 /home/pi4/iaq_data/iaq.db ".backup /home/pi4/iaq_data/backups/iaq_$(date
 
 ---
 
+## Sensor Ingestion (PMS5003 / MH-Z19B / SGP40 / DHT22)
+
+A second, independent process (`iaq_sensors.py`, own systemd unit) polls four
+pollutant/environmental sensors and writes one aggregated row to the new
+`sensor_readings` table every 60 seconds, aligned to the same wall-clock
+minute boundary, using the same naive-local-time convention
+`ct_vectors.window_start` uses. The two tables do NOT exact-match on
+`window_start` — `ct_vectors`' windows aren't minute-aligned (they drift
+from Pi boot time; see `sensors/aggregator.py`'s docstring) — so
+`iaq_forecast.py` joins them by flooring both to the minute at query time,
+the same "floor_to_minute" approach the offline
+`merge_vision_and_sensor_data.py` already uses.
+
+**Wiring:**
+- **PMS5003** (PM1/PM2.5/PM10) — UART, 9600 baud. The Pi 4's one hardware
+  UART (GPIO14/15) is routed to Bluetooth by default; either disable
+  Bluetooth (`dtoverlay=disable-bt` in `/boot/firmware/config.txt`) to free
+  it, or use a USB-to-TTL adapter.
+- **MH-Z19B** (CO2) — UART, 9600 baud, command/response protocol. Needs its
+  own serial port, separate from PMS5003 — typically a second USB-to-TTL
+  adapter.
+- **SGP40** (VOC index) — I2C, address 0x59. Enable I2C via `raspi-config`
+  first. Needs temperature/humidity compensation, supplied from the DHT22
+  reading each cycle.
+- **DHT22/AM2302** (temp/humidity) — single GPIO data pin (default BCM4).
+
+**Install:**
+```bash
+# requirements.txt already includes pyserial, smbus2,
+# sensirion-gas-index-algorithm, adafruit-circuitpython-dht, Adafruit-Blinka
+sudo apt install libgpiod2
+pip install -r requirements.txt
+
+# Confirm actual serial device paths after wiring — USB enumeration order
+# isn't guaranteed stable across reboots if other USB-serial devices are
+# plugged in; use /dev/serial/by-id/... for a stable path if that matters.
+ls /dev/ttyUSB* /dev/ttyAMA*
+
+# Edit PMS5003_PORT / MHZ19B_PORT / I2C_BUS / DHT22_GPIO_PIN at the top of
+# iaq_sensors.py to match your actual wiring, then:
+sudo cp iaq-sensors.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now iaq-sensors.service
+journalctl -u iaq-sensors.service -f
+```
+
+**Known caveats, not implementation bugs:**
+- DHT22 reads fail checksum some fraction of the time even with the
+  C-backed timing library — normal for this sensor/protocol. A window with
+  no successful DHT22 read reports `temp`/`hum` as `NULL` rather than a
+  stale or fabricated value; the training pipeline's own
+  `feature_engineering.py` already forward/back-fills missing values, so
+  this degrades gracefully downstream.
+- MH-Z19B's factory auto-baseline-calibration assumes the sensor sees
+  fresh ~400ppm air at least once every 24h. If this room is continuously
+  occupied, ABC can drift the CO2 baseline over time — consider disabling
+  ABC and calibrating manually if that's the case for your deployment.
+- SGP40's VOC Index needs a continuous ~1Hz sampling stream to converge
+  (Sensirion's gas-index algorithm maintains a running baseline) — the
+  aggregator samples it every ~1s internally regardless of the 60s output
+  cadence for exactly this reason; don't reduce that internal rate.
+- This ingestion path is new and has not been run against real hardware
+  as part of this change — the protocol/checksum logic for all three
+  custom drivers (PMS5003, MH-Z19B, SGP40's CRC-8) was verified against
+  known-good test vectors and datasheet values in isolation, and the
+  aggregation + dual-writer-process DB logic was integration-tested, but
+  end-to-end behavior on an actual wired Pi still needs to be confirmed.
+
+---
+
 ## Known Limitations
 
 - Single-camera design — one camera frame drives door state for all configured machines and the overall person count.
 - SQLite is appropriate for single-Pi, single-writer deployments. For multiple Pis feeding one central store, swap `db_writer.py`'s connection for PostgreSQL (schema translates directly — see comments in that file).
 - True per-second sampling is bounded by real inference speed on the hardware; see [Performance Notes](#performance-notes-for-pi-4).
+- Sensor ingestion (`iaq_sensors.py`) has zero built-in redundancy — if a
+  sensor's serial port or I2C bus becomes unavailable mid-run, that
+  sensor's columns go permanently `NULL` until the service restarts. No
+  auto-reconnect logic exists yet.
 
 ---
 
