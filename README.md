@@ -98,6 +98,49 @@ deployed by copying it into this repo's directory on the Pi — see
 
 ---
 
+## System Topology — Where Everything Physically Runs
+
+Everything that *thinks* (YOLO inference, BiLSTM inference) and everything
+that's *stored* (the database) lives on the **Raspberry Pi 4**. Training
+happens elsewhere, once, before deployment. Nothing here needs internet
+access at runtime.
+
+| Component | Physical location | Runs inside | Config/path |
+|---|---|---|---|
+| **Camera** | Plugged into the **Pi** directly — USB port or CSI ribbon connector | N/A (hardware) | `VIDEO_SOURCE` in `iaq_pipeline_pi.py` |
+| **YOLO — inference** | **On the Pi**, ARM CPU, via NCNN | `iaq_pipeline_pi.py` | `MODEL_PATH` → exported `*_ncnn_model/` folder |
+| **YOLO — training** | **NOT on the Pi** — a dev machine (GPU recommended) | `context-aware-bilstm/src/vision/train_door_person_detector.py`, exported via `export_model.py` | Trained weights exported to NCNN, folder copied to the Pi |
+| **BiLSTM — inference** | **On the Pi**, ARM CPU, via ONNX Runtime (no PyTorch on the Pi at all) | `iaq_forecast.py` (own process, from [context-aware-bilstm-edge](https://github.com/sunilkahalekar/context-aware-bilstm-edge)) | `--model-dir` → copied `onnx_export/` folder |
+| **BiLSTM — training** | **NOT on the Pi** — a dev machine (needs PyTorch) | `context-aware-bilstm-edge/train_bilstm.py` → `export_onnx.py` | Trains on a CSV, exports `model.onnx`, copied to the Pi |
+| **Database** | **On the Pi's local storage** (SD card or USB SSD) | SQLite file, no separate DB server | `DB_PATH` / `--db-path`, default `/home/pi4/iaq_data/iaq.db` |
+| **Pollutant sensors** | Either wired into the **Pi's own** UART/I2C/GPIO, or into an **ESP32** which plugs into the **Pi's USB port** | `iaq_sensors.py` (direct, step 13A) or `iaq_sensors_esp32.py` (ESP32 relay, step 13B) | See [step 13](#13-pollutant-sensor-ingestion) |
+| **ESP32** (if used) | Standalone board, sensors wired to it, connects to the **Pi via USB** | Its own firmware (`esp32_sensor_node.ino`) — **runs no AI model**, only relays sensor JSON | N/A — a data relay, not a compute node |
+| **Dashboard** | **On the Pi**, serves a web page | `dashboard.py`, port 8001 | Reads the same SQLite file, read-only |
+
+```
+                    ┌─── trains on a dev machine, THEN copied to the Pi ───┐
+                    │                                                      │
+   [Camera] ──USB/CSI──► [Raspberry Pi 4] ◄──USB── [ESP32 + 4 sensors]     │
+                              │  │  │                    (or sensors        │
+                              │  │  └─ dashboard.py (:8001)  wired direct)  │
+                              │  │                                          │
+                              │  └─ iaq_forecast.py ──ONNX Runtime── BiLSTM ◄┘
+                              │        (reads DB, writes forecasts)
+                              │
+                              ├─ iaq_pipeline_pi.py ──NCNN── YOLO ◄──────────────┘
+                              │        (reads camera, writes ct_vectors)
+                              │
+                              ├─ iaq_sensors.py / iaq_sensors_esp32.py
+                              │        (writes sensor_readings)
+                              │
+                              └─ /home/pi4/iaq_data/iaq.db  (SQLite — ALL data lives here)
+```
+
+Four independent processes, one Pi, one database file, one camera port,
+zero cloud dependency once deployed.
+
+---
+
 ## Repository Layout
 
 ```
@@ -331,6 +374,30 @@ python3 dashboard.py --db /home/pi4/iaq_data/iaq.db --port 8001
 Open `http://<PI_IP_ADDRESS>:8001` from any device on the same network.
 
 ✅ Live video appears top-left; machine status cards and the person-count card update; the pipeline-health badge shows green "running".
+
+**If steps 13-14 (sensors, forecast) are installed, the dashboard also shows, further down the page:**
+
+| Panel | What it shows | Backed by |
+|---|---|---|
+| Air Quality — Current Readings | Stat cards for PM1/PM2.5/PM10/CO2/VOC/temp/humidity, color-coded (green/amber/red) against reference bands | `sensor_readings` table |
+| BiLSTM Forecast — 10 Minutes Ahead | Current vs. predicted PM2.5 with a trend arrow, plus a full predicted-values grid | `forecasts` table |
+| Pollutant Trend — Actual vs. Forecast | Line chart, actual (solid) vs. forecast (dashed) overlaid on the timestamp each point is *for* — the forecast line extending past the actual line is the near-future prediction, not a bug | Both tables, joined in `fetch_air_quality_history()` |
+| Alert banner | Appears only when a current or predicted reading crosses the "danger" band | Same threshold logic as the stat cards |
+
+If steps 13-14 aren't installed, these panels show a plain "not installed
+yet" note instead of an error — the dashboard degrades gracefully rather
+than assuming every deployment has sensors and a forecast model.
+
+**Read this before trusting the colors**: `THRESHOLDS` at the top of
+`dashboard.py` uses commonly-cited reference bands (US EPA AQI breakpoints
+for PM, general indoor-air-quality guidance for CO2, Sensirion's own
+published index scale for VOC) — **not** a substitute for your facility's
+actual applicable regulation. Confirm the right standard for your
+jurisdiction/industry with your safety officer before treating this
+color-coding as a compliance signal. And critically: **the alert banner is
+a view only** — it doesn't page anyone, sound an alarm, or log an audit
+trail. See [CLAUDE.md](CLAUDE.md) for what a real SOS/alert-delivery layer
+on top of this would need.
 
 ### 12. Install as background services
 

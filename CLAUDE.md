@@ -161,6 +161,48 @@ scheduling priority. This ordering is deliberate: a missed camera frame
 is unrecoverable, a late sensor sample is a minor gap, a late forecast is
 barely noticeable. Don't rebalance this without the same reasoning.
 
+## dashboard.py's air-quality panels — what they are and are not
+
+`THRESHOLDS` (top of `dashboard.py`) drives every color-coded status you
+see (stat cards, forecast grid, the alert banner). These are commonly-
+cited reference bands (EPA AQI breakpoints for PM, general indoor-air-
+quality guidance for CO2, Sensirion's own published index scale for
+VOC) — not a certified safety threshold for any specific jurisdiction or
+industry. If you change these, update both the Python dict and the
+matching note in README.md's step 11; don't let them drift apart.
+
+**The alert banner is a view, not an alert system.** It reads the same
+`overall_current`/`overall_predicted` classification the stat cards use
+and shows a red banner — that's it. It does not page anyone, sound a
+buzzer, write to an `alerts` table, or persist any record that a
+threshold was ever crossed. If you're building the actual SOS/alert-
+delivery layer this repo doesn't have yet, don't extend this banner in
+place — build a separate, independent component with its own hard-
+threshold check that doesn't depend on the dashboard process being open
+in someone's browser. See the top-level conversation context (or your own
+design doc) for why a safety alert shouldn't have a "someone has to be
+looking at the webpage" failure mode.
+
+**The trend chart aligns actual and predicted data by the timestamp each
+point is *for*, not by when the forecast was computed** — see
+`fetch_air_quality_history()`'s docstring in `dashboard.py`. This is what
+makes the forecast line visibly extend past the actual line's right edge
+(predictions into the near future) instead of the two lines just tracking
+each other with a confusing offset. If you add a similar chart elsewhere,
+reuse this alignment convention, not a `predicted_at`-keyed one.
+
+**Initial page load needs an explicit wider AQ-trend fetch.** The
+person/door "live" view intentionally defaults to a narrow 1-minute
+rolling window; the AQ trend chart reusing that same window on page load
+was a real bug caught during testing — it showed the forecast line but
+an empty actual line, purely because 1 minute is too narrow a window to
+reliably catch a once-per-minute `sensor_readings` write. Fixed by an
+explicit 60-minute initial fetch (`initialAqTrend()`), independent of the
+vision-side live/preset state. If you touch the trend chart's fetch
+timing again, keep those two windows decoupled — they don't need to be
+the same value, but a viewer clicking a person/door preset shouldn't feel
+like the whole page is one calendar control.
+
 ## Known open issues
 
 - **Sensor ingestion has zero built-in redundancy.** If a serial port or
