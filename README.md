@@ -117,14 +117,19 @@ iaq_pipeline/
 │   └── chart.umd.js          # Self-hosted Chart.js (no CDN/internet dependency)
 ├── iaq-pipeline.service      # systemd unit — main pipeline
 ├── iaq-dashboard.service     # systemd unit — dashboard
-├── iaq_sensors.py             # Separate process: pollutant sensors + DB writer
-├── iaq-sensors.service       # systemd unit — sensor ingestion
-└── sensors/
-    ├── pms5003.py             # PM1/PM2.5/PM10 over UART
-    ├── mhz19b.py               # CO2 over UART
-    ├── sgp40.py                 # VOC index over I2C
-    ├── dht22.py                  # Temp/humidity over 1-wire GPIO
-    └── aggregator.py            # Polls all four, emits one 60s row
+├── iaq_sensors.py             # 13A: direct-wired sensors + DB writer
+├── iaq-sensors.service       # systemd unit — 13A sensor ingestion
+├── sensors/                   # 13A: direct-wired drivers
+│   ├── pms5003.py             # PM1/PM2.5/PM10 over UART
+│   ├── mhz19b.py               # CO2 over UART
+│   ├── sgp40.py                 # VOC index over I2C
+│   ├── dht22.py                  # Temp/humidity over 1-wire GPIO
+│   └── aggregator.py            # Polls all four, emits one 60s row
+├── iaq_sensors_esp32.py       # 13B: ESP32-relay ingestion (USB-serial JSON)
+├── iaq-sensors-esp32.service # systemd unit — 13B sensor ingestion
+└── esp32_sensor_node/          # 13B: ESP32 firmware (owns all 4 sensors)
+    ├── esp32_sensor_node.ino
+    └── README.md                # wiring diagram, firmware setup, bench-test steps
 ```
 
 `live_stream.py`, if present from earlier development, is now superseded by the streaming built into `iaq_pipeline_pi.py` — keep it only as a standalone diagnostic tool when the main pipeline isn't running, never alongside it (camera contention).
@@ -350,12 +355,27 @@ steps are optional and independent of each other and of steps 1–12 above
 
 ### 13. Pollutant sensor ingestion
 
-A separate process (`iaq_sensors.py`, own systemd unit) polls four
-pollutant/environmental sensors and writes one aggregated row to a
-`sensor_readings` table every 60 seconds, aligned to the wall-clock
-minute boundary using the same naive-local-time convention
-`ct_vectors.window_start` uses (see [CLAUDE.md](CLAUDE.md) for why that
-consistency matters and `ct_vectors` itself is NOT minute-aligned).
+Two integration paths, both writing into the same `sensor_readings`
+table (aligned to the wall-clock minute boundary using the same
+naive-local-time convention `ct_vectors.window_start` uses — see
+[CLAUDE.md](CLAUDE.md) for why that consistency matters and `ct_vectors`
+itself is NOT minute-aligned). **Pick one, not both.**
+
+- **13A — Direct-wired** (below): sensors wired straight to the Pi's own
+  UART/I2C/GPIO. Simpler (one less device), but the Pi 4 has only one
+  usable hardware UART, shared with Bluetooth — you'll need to free it
+  (`dtoverlay=disable-bt`) and use a USB-to-TTL adapter for the second
+  UART sensor.
+- **13B — ESP32 relay** ([esp32_sensor_node/](esp32_sensor_node/)): an
+  ESP32 owns all four sensors (it has three independent hardware UARTs,
+  no contention) and hands the Pi one simple JSON stream over USB. More
+  hardware, cleaner wiring, no Bluetooth trade-off. See
+  [esp32_sensor_node/README.md](esp32_sensor_node/README.md) for firmware
+  setup and wiring, then run `iaq_sensors_esp32.py` /
+  `iaq-sensors-esp32.service` on the Pi instead of `iaq_sensors.py` /
+  `iaq-sensors.service`.
+
+#### 13A. Direct-wired
 
 **Wiring:**
 
@@ -432,6 +452,38 @@ sudo systemctl status iaq-sensors.service
   integration-tested against a realistic synthetic database, but
   end-to-end behavior on an actual wired Pi is unconfirmed. Run steps
   above carefully and don't skip the verification checks.
+
+#### 13B. ESP32 relay
+
+Full setup, wiring diagram, and bench-test checklist:
+[esp32_sensor_node/README.md](esp32_sensor_node/README.md). Once the
+ESP32 is flashed and bench-tested standalone, on the Pi:
+
+```bash
+ls /dev/ttyUSB* /dev/ttyACM*   # confirm the device path
+python3 iaq_sensors_esp32.py --port /dev/ttyUSB0   # foreground test first
+```
+✅ Prints one `wrote sensor_readings row: {...}` line per minute.
+```bash
+sqlite3 /home/pi4/iaq_data/iaq.db "SELECT * FROM sensor_readings ORDER BY id DESC LIMIT 5;"
+```
+✅ Real, recent, increasing `window_start` values. Then install as a
+service (NOT alongside `iaq-sensors.service` from 13A):
+```bash
+sudo cp iaq-sensors-esp32.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now iaq-sensors-esp32.service
+```
+
+**Verified**: the Python ingestion logic (`iaq_sensors_esp32.py`) —
+JSON parsing, malformed-line handling, and specifically the realistic
+case of ESP32 boot-log lines (`ets Jul 29 2019...`) leaking onto the same
+serial connection at power-on/reset, which must be dropped without
+crashing ingestion — tested directly, including a full DB write. **Not
+verified**: the ESP32 firmware itself has not been compiled or flashed
+(no Arduino/ESP32 toolchain was available in the environment this was
+built in) — see [esp32_sensor_node/README.md](esp32_sensor_node/README.md)'s
+Status section before trusting it.
 
 ### 14. BiLSTM forecast sidecar
 

@@ -102,6 +102,30 @@ reuse `feature_engineering.load_bundle()`'s persisted `door_lo`/`door_hi`
 — don't let `apply_door_orientation_fix()` recompute them from your query
 result.
 
+## Two sensor-integration paths — pick one, know why the other exists
+
+`iaq_sensors.py` (+ `sensors/*.py`) wires all four sensors straight to
+the Pi. `iaq_sensors_esp32.py` (+ `esp32_sensor_node/`) instead reads one
+JSON line/minute from an ESP32 that owns the sensors itself. The reason
+for the second path: the Pi 4 has exactly one usable hardware UART, and
+two of the four sensors (PMS5003, MH-Z19B) each need their own UART — the
+direct-wired path works around this with `dtoverlay=disable-bt` + a
+USB-to-TTL adapter, which is a real but slightly awkward constraint; the
+ESP32 (three independent hardware UARTs) sidesteps it entirely. Both
+paths write into the identical `sensor_readings` schema — **never run
+both at once**, they'd race on the same table. If you add a fifth
+sensor, decide which path owns it and update only that path's driver
+code; don't half-implement it in both.
+
+**ESP32 boot-log lines leak onto the same serial connection as the JSON
+data.** Every ESP32 power-on/reset prints diagnostic text (`ets Jul 29
+2019 12:21:46`, `rst:0x1 (POWERON_RESET)...`) over UART0 — the same
+connection `iaq_sensors_esp32.py` reads the JSON stream from. This is
+normal, not a firmware bug; `parse_esp32_line()` must treat
+non-JSON/malformed lines as "drop and continue," never as a fatal error
+— confirmed with a direct test simulating this exact scenario during the
+ESP32 integration work.
+
 ## Sensor hardware gotchas (see `sensors/*.py` docstrings for full detail)
 
 - **PMS5003**: ~30s fan warm-up needed after power-on before readings are

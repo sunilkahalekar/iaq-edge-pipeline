@@ -1,0 +1,38 @@
+[Unit]
+Description=IAQ Sensor Ingestion via ESP32 relay (USB-serial JSON -> SQLite)
+After=network-online.target iaq-pipeline.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi4
+WorkingDirectory=/home/pi4/iaq_pipeline
+ExecStart=/home/pi4/iaq_pipeline/venv/bin/python /home/pi4/iaq_pipeline/iaq_sensors_esp32.py --port /dev/ttyUSB0
+Restart=on-failure
+RestartSec=5
+Nice=5
+StandardOutput=append:/home/pi4/iaq_data/sensors.log
+StandardError=append:/home/pi4/iaq_data/sensors.log
+
+[Install]
+WantedBy=multi-user.target
+
+# USE THIS INSTEAD OF iaq-sensors.service IF YOU'RE USING THE ESP32
+# SENSOR NODE (esp32_sensor_node/) RATHER THAN direct-wired sensors --
+# do not enable both, they write into the same sensor_readings table.
+#
+# Confirm the ESP32's actual device path first -- USB enumeration order
+# isn't guaranteed stable across reboots if other USB-serial devices are
+# plugged in; use /dev/serial/by-id/... in ExecStart above for a stable
+# path if that matters for your deployment:
+#   ls -l /dev/serial/by-id/
+#
+# Install with:
+#   sudo cp iaq-sensors-esp32.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iaq-sensors-esp32.service
+#
+# Check status / logs with:
+#   sudo systemctl status iaq-sensors-esp32.service
+#   journalctl -u iaq-sensors-esp32.service -f
+#   sqlite3 /home/pi4/iaq_data/iaq.db "SELECT * FROM sensor_readings ORDER BY id DESC LIMIT 5;"
