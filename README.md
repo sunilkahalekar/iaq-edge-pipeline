@@ -1,6 +1,6 @@
 # IAQ Door & Occupancy Monitor — Raspberry Pi 4
 
-A self-contained system that watches a camera feed with a YOLO segmentation model, tracks door open/closed state per machine and live person count, logs everything to a local SQLite database once per second, and serves a live web dashboard — all running on a single Raspberry Pi 4, no cloud dependency required. Optionally also ingests four pollutant sensors and runs a live 10-minute-ahead air-quality forecast, via two companion repos — see [step 13](#13-pollutant-sensor-ingestion) and [step 14](#14-bilstm-forecast-sidecar).
+A self-contained system that watches a camera feed with a YOLO segmentation model, tracks door open/closed state per machine and live person count, logs everything to a local SQLite database once per second, and serves a live web dashboard — all running on a single Raspberry Pi 4, no cloud dependency required. Optionally also ingests four pollutant sensors and runs a live 10-minute-ahead air-quality forecast, via two companion repos. Reference: [step 13](#13-pollutant-sensor-ingestion) and [step 14](#14-bilstm-forecast-sidecar).
 
 > Modifying this codebase? See [CLAUDE.md](CLAUDE.md) for the internals
 > reference — the three-process architecture, timestamp-handling gotchas,
